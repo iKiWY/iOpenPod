@@ -86,7 +86,7 @@ def test_rejects_body_over_size_cap(monkeypatch) -> None:
     monkeypatch.setattr(download.requests, "Session", lambda: _FakeSession(_FakeResponse(oversized)))
     with pytest.raises(ArtworkSearchError) as excinfo:
         download.fetch_image("https://example.com/big.png")
-    assert "too large" in excinfo.value.info.message.lower()
+    assert "too large" in excinfo.value.info.title.lower()
 
 
 def test_rejects_body_that_is_not_a_real_image(monkeypatch) -> None:

@@ -77,7 +77,7 @@ def fetch_image(url: str) -> bytes:
                 if total > MAX_IMAGE_BYTES:
                     raise _fail(
                         "That image is too large",
-                        f"That image is too large. Artwork must be smaller than {MAX_IMAGE_BYTES // (1024 * 1024)} MB.",
+                        f"Artwork must be smaller than {MAX_IMAGE_BYTES // (1024 * 1024)} MB.",
                     )
                 chunks.append(chunk)
     except requests.TooManyRedirects as exc:
