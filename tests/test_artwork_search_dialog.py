@@ -15,6 +15,7 @@ def dialog(qtbot):
     widget = ArtworkSearchDialog(
         SeedQuery(text="Daft Punk Discovery", artist="Daft Punk", album="Discovery"),
         auto_search=False,
+        load_thumbnails=False,
     )
     qtbot.addWidget(widget)
     return widget
@@ -76,3 +77,31 @@ def test_both_providers_failing_shows_error_state(dialog) -> None:
     dialog.note_provider_failed("Cover Art Archive")
     assert dialog.result_count() == 0
     assert dialog.is_showing_error()
+
+
+def test_stale_generation_results_are_ignored(dialog) -> None:
+    # Simulate a search in flight (generation 1) that is then superseded by
+    # a new search (generation 2) before the old workers report back.
+    dialog._search_generation = 1
+    stale_generation = dialog._search_generation
+    dialog._search_generation += 1
+    dialog._pending_providers = 2
+
+    dialog.append_results([_candidate("https://old/1.jpg")], _generation=stale_generation)
+    assert dialog.result_count() == 0
+    assert dialog._pending_providers == 2  # the new search's counter must be untouched
+
+    dialog.append_results([_candidate("https://new/1.jpg")], _generation=dialog._search_generation)
+    assert dialog.result_count() == 1
+
+
+def test_stale_generation_failure_does_not_decrement_pending_providers(dialog) -> None:
+    dialog._search_generation = 1
+    stale_generation = dialog._search_generation
+    dialog._search_generation += 1
+    dialog._pending_providers = 2
+
+    dialog.note_provider_failed("iTunes", _generation=stale_generation)
+    assert dialog._pending_providers == 2
+    assert dialog._failed_providers == []
+    assert not dialog.is_showing_error()

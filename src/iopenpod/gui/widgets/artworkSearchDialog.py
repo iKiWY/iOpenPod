@@ -68,15 +68,23 @@ class ArtworkSearchDialog(QDialog):
         parent: QWidget | None = None,
         *,
         auto_search: bool = True,
+        load_thumbnails: bool = True,
     ):
         super().__init__(parent)
         self._seed = seed
+        self._load_thumbnails = load_thumbnails
         self._chosen_path: str | None = None
         self._candidates: list[ArtworkCandidate] = []
         self._seen_urls: set[str] = set()
         self._failed_providers: list[str] = []
         self._pending_providers = 0
         self._showing_error = False
+        # Bumped on every _on_search call so late-arriving results/failures
+        # from a superseded search (the user re-searched before the old
+        # workers finished) can be told apart from the current one and
+        # ignored, instead of corrupting the new search's candidate list
+        # and pending-provider count.
+        self._search_generation = 0
 
         self.setWindowTitle("Find Artwork Online")
         self.setMinimumSize(640, 560)
@@ -222,24 +230,41 @@ class ArtworkSearchDialog(QDialog):
         self._failed_providers = []
         self._showing_error = False
         self._pending_providers = len(modules)
+        self._search_generation += 1
+        generation = self._search_generation
         self._search_btn.setEnabled(False)
+        self._search_input.setEnabled(False)
         self._status_label.setText("Searching…")
         self._grid_host.hide()
         self._state_panel.show()
-        self._state_panel.show_loading("Searching for artwork…", "Checking iTunes and the Cover Art Archive.")
+        provider_names = ", ".join(module.SOURCE_NAME for module in modules)
+        self._state_panel.show_loading("Searching for artwork…", f"Checking {provider_names}.")
 
         pool = ThreadPoolSingleton.get_instance()
         for module in modules:
             name = module.SOURCE_NAME
             worker = Worker(module.search, seed)
-            worker.signals.result.connect(self.append_results)
+            worker.signals.result.connect(
+                lambda candidates, gen=generation: self.append_results(candidates, _generation=gen)
+            )
             worker.signals.error.connect(
-                lambda _error, provider=name: self.note_provider_failed(provider)
+                lambda _error, provider=name, gen=generation: self.note_provider_failed(provider, _generation=gen)
             )
             pool.start(worker)
 
-    def append_results(self, candidates: list[ArtworkCandidate]) -> None:
-        """Add one provider's results to the grid. Safe to call repeatedly."""
+    def append_results(self, candidates: list[ArtworkCandidate], *, _generation: int | None = None) -> None:
+        """Add one provider's results to the grid. Safe to call repeatedly.
+
+        ``_generation`` lets a background worker's callback identify which
+        search it belongs to; a result from a search that has since been
+        superseded by a newer one is dropped rather than mixed into the
+        current results. Direct callers (tests, and the picking code below)
+        omit it, which always applies unconditionally.
+        """
+        if _generation is not None and _generation != self._search_generation:
+            log.debug("Dropping stale artwork results from generation %s (current %s)", _generation, self._search_generation)
+            return
+
         self._pending_providers = max(0, self._pending_providers - 1)
         added = False
         for candidate in candidates or []:
@@ -258,8 +283,17 @@ class ArtworkSearchDialog(QDialog):
             self._grid_host.show()
         self._refresh_status()
 
-    def note_provider_failed(self, provider: str) -> None:
-        """Record a provider failure. Only both failing is fatal."""
+    def note_provider_failed(self, provider: str, *, _generation: int | None = None) -> None:
+        """Record a provider failure. Only both failing is fatal.
+
+        ``_generation`` mirrors ``append_results``: a failure reported by a
+        superseded search's worker is dropped instead of being counted
+        against the current search's pending-provider total.
+        """
+        if _generation is not None and _generation != self._search_generation:
+            log.debug("Dropping stale provider failure from generation %s (current %s)", _generation, self._search_generation)
+            return
+
         self._pending_providers = max(0, self._pending_providers - 1)
         if provider not in self._failed_providers:
             self._failed_providers.append(provider)
@@ -281,6 +315,7 @@ class ArtworkSearchDialog(QDialog):
 
         if self._pending_providers == 0:
             self._search_btn.setEnabled(True)
+            self._search_input.setEnabled(True)
 
         count = len(self._candidates)
         if count:
@@ -313,7 +348,7 @@ class ArtworkSearchDialog(QDialog):
                 widget.deleteLater()
 
     def _add_card(self, candidate: ArtworkCandidate, index: int) -> None:
-        card = _ArtworkResultCard(candidate, self)
+        card = _ArtworkResultCard(candidate, self, load_thumbnail=self._load_thumbnails)
         card.picked.connect(self._on_pick)
         self._grid.addWidget(card, index // GRID_COLUMNS, index % GRID_COLUMNS)
 
@@ -366,7 +401,7 @@ class _ArtworkResultCard(QFrame):
 
     picked = pyqtSignal(str)
 
-    def __init__(self, candidate: ArtworkCandidate, parent: QWidget | None = None):
+    def __init__(self, candidate: ArtworkCandidate, parent: QWidget | None = None, *, load_thumbnail: bool = True):
         super().__init__(parent)
         self._candidate = candidate
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -409,7 +444,8 @@ class _ArtworkResultCard(QFrame):
         detail.setFixedWidth(THUMB_SIZE)
         layout.addWidget(detail)
 
-        self._load_thumbnail(candidate.thumb_url)
+        if load_thumbnail:
+            self._load_thumbnail(candidate.thumb_url)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         if event.button() == Qt.MouseButton.LeftButton:
