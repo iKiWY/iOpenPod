@@ -62,6 +62,13 @@ def _provider_modules():
 class ArtworkSearchDialog(QDialog):
     """Search two keyless providers for album art, or paste an image URL."""
 
+    # Carries the downloaded temp image path once a pick (or pasted URL)
+    # finishes downloading. The dialog stays open when this fires — the
+    # track editor runs the crop dialog on top of it and only closes this
+    # dialog itself once the crop is accepted, so cancelling the cropper
+    # returns to a still-open search dialog with results intact.
+    imageReady = pyqtSignal(str)
+
     def __init__(
         self,
         seed: SeedQuery,
@@ -76,9 +83,17 @@ class ArtworkSearchDialog(QDialog):
         self._chosen_path: str | None = None
         self._candidates: list[ArtworkCandidate] = []
         self._seen_urls: set[str] = set()
+        self._source_counts: dict[str, int] = {}
         self._failed_providers: list[str] = []
+        self._first_failure_info = None
         self._pending_providers = 0
         self._showing_error = False
+        # Set once this dialog itself is rejected or closed (Cancel, Esc, the
+        # window-manager close control). A download already in flight when
+        # that happens still lands afterwards; _on_downloaded checks this to
+        # delete the temp file instead of emitting imageReady into a dialog
+        # nobody is looking at anymore, which would otherwise leak the file.
+        self._abandoned = False
         # Bumped on every _on_search call so late-arriving results/failures
         # from a superseded search (the user re-searched before the old
         # workers finished) can be told apart from the current one and
@@ -228,6 +243,7 @@ class ArtworkSearchDialog(QDialog):
 
         self._clear_results()
         self._failed_providers = []
+        self._first_failure_info = None
         self._showing_error = False
         self._pending_providers = len(modules)
         self._search_generation += 1
@@ -240,16 +256,25 @@ class ArtworkSearchDialog(QDialog):
         provider_names = ", ".join(module.SOURCE_NAME for module in modules)
         self._state_panel.show_loading("Searching for artwork…", f"Checking {provider_names}.")
 
+        # Each provider gets a guaranteed share of the grid so a fast
+        # provider (iTunes, ~300ms) cannot answer with a full page before a
+        # slow one (MusicBrainz, rate-limited to 1req/s plus a second CAA
+        # round trip) ever gets a chance to contribute.
+        per_provider_budget = max(1, MAX_RESULTS // len(modules))
+
         pool = ThreadPoolSingleton.get_instance()
         for module in modules:
             name = module.SOURCE_NAME
-            worker = Worker(module.search, seed)
+            worker = Worker(module.search, seed, per_provider_budget)
             worker.signals.result.connect(
                 lambda candidates, gen=generation: self.append_results(candidates, _generation=gen)
             )
             worker.signals.error.connect(
-                lambda _error, provider=name, gen=generation: self.note_provider_failed(provider, _generation=gen)
+                lambda error_tuple, provider=name, gen=generation: self.note_provider_failed(
+                    provider, error_tuple, _generation=gen
+                )
             )
+            worker.signals.finished.connect(lambda gen=generation: self._on_worker_finished(_generation=gen))
             pool.start(worker)
 
     def append_results(self, candidates: list[ArtworkCandidate], *, _generation: int | None = None) -> None:
@@ -260,20 +285,33 @@ class ArtworkSearchDialog(QDialog):
         superseded by a newer one is dropped rather than mixed into the
         current results. Direct callers (tests, and the picking code below)
         omit it, which always applies unconditionally.
+
+        Each source is capped at its guaranteed share (``MAX_RESULTS //``
+        provider count) so long as another provider is still outstanding;
+        once every other provider has already reported in (success or
+        failure — see ``_on_worker_finished``/``note_provider_failed``),
+        the last one may use whatever grid capacity remains rather than
+        being held to its fixed share.
         """
         if _generation is not None and _generation != self._search_generation:
             log.debug("Dropping stale artwork results from generation %s (current %s)", _generation, self._search_generation)
             return
 
-        self._pending_providers = max(0, self._pending_providers - 1)
+        modules_count = max(1, len(_provider_modules()))
+        base_budget = max(1, MAX_RESULTS // modules_count)
+        effective_budget = MAX_RESULTS if self._pending_providers <= 1 else base_budget
+
         added = False
         for candidate in candidates or []:
             if len(self._candidates) >= MAX_RESULTS:
                 break
             if candidate.full_url in self._seen_urls:
                 continue
+            if self._source_counts.get(candidate.source, 0) >= effective_budget:
+                continue
             self._seen_urls.add(candidate.full_url)
             self._candidates.append(candidate)
+            self._source_counts[candidate.source] = self._source_counts.get(candidate.source, 0) + 1
             self._add_card(candidate, len(self._candidates) - 1)
             added = True
 
@@ -283,30 +321,61 @@ class ArtworkSearchDialog(QDialog):
             self._grid_host.show()
         self._refresh_status()
 
-    def note_provider_failed(self, provider: str, *, _generation: int | None = None) -> None:
+    def note_provider_failed(self, provider: str, error_tuple=None, *, _generation: int | None = None) -> None:
         """Record a provider failure. Only both failing is fatal.
 
         ``_generation`` mirrors ``append_results``: a failure reported by a
         superseded search's worker is dropped instead of being counted
         against the current search's pending-provider total.
+
+        ``error_tuple`` is the ``(exc_type, value, traceback)`` tuple from
+        ``Worker.signals.error``; its ``describe_artwork_error`` info is kept
+        so the both-failed panel can show the real reason (MusicBrainz busy,
+        an HTTP status, etc.) instead of always the same generic copy.
         """
         if _generation is not None and _generation != self._search_generation:
             log.debug("Dropping stale provider failure from generation %s (current %s)", _generation, self._search_generation)
             return
 
-        self._pending_providers = max(0, self._pending_providers - 1)
         if provider not in self._failed_providers:
             self._failed_providers.append(provider)
+
+        if error_tuple is not None and self._first_failure_info is None:
+            from iopenpod.artwork_search.errors import describe_artwork_error
+
+            self._first_failure_info = describe_artwork_error(error_tuple[1])
 
         provider_count = len(_provider_modules())
         if not self._candidates and len(self._failed_providers) >= provider_count:
             self._showing_error = True
             self._grid_host.hide()
             self._state_panel.show()
-            self._state_panel.show_error(
-                "Artwork search did not work",
-                "Neither artwork service answered. Check your connection and try again.",
-            )
+            info = self._first_failure_info
+            if info is not None:
+                self._state_panel.show_error(info.title, info.message, code=info.code)
+            else:
+                self._state_panel.show_error(
+                    "Artwork search did not work",
+                    "Neither artwork service answered. Check your connection and try again.",
+                )
+        self._refresh_status()
+
+    def _on_worker_finished(self, *, _generation: int | None = None) -> None:
+        """Decrement the pending-provider count. Connected to every worker's ``finished``.
+
+        ``Worker.run`` (application/runtime.py) emits exactly one
+        ``finished`` per run in all three outcomes: result, error, or being
+        cancelled with neither (which happens when
+        ``DeviceManager.cancel_all_operations()`` fires mid-search, e.g. on
+        eject or a device disconnect that is not user-driven). Decrementing
+        here — instead of in ``append_results``/``note_provider_failed``,
+        which only run on two of those three outcomes — is what keeps a
+        cancelled search from wedging the dialog on "Searching…" forever.
+        """
+        if _generation is not None and _generation != self._search_generation:
+            log.debug("Dropping stale worker-finished from generation %s (current %s)", _generation, self._search_generation)
+            return
+        self._pending_providers = max(0, self._pending_providers - 1)
         self._refresh_status()
 
     def _refresh_status(self) -> None:
@@ -341,6 +410,7 @@ class ArtworkSearchDialog(QDialog):
     def _clear_results(self) -> None:
         self._candidates = []
         self._seen_urls = set()
+        self._source_counts = {}
         while self._grid.count():
             item = self._grid.takeAt(0)
             widget = item.widget() if item is not None else None
@@ -380,11 +450,25 @@ class ArtworkSearchDialog(QDialog):
         ThreadPoolSingleton.get_instance().start(worker)
 
     def _on_downloaded(self, path: str) -> None:
+        if self._abandoned:
+            # The dialog was closed (window-manager close, Cancel, Esc)
+            # while this download was still in flight. A top-level QDialog
+            # can be closed regardless of setEnabled(False), so this worker
+            # kept running and only now delivered its result to a dialog
+            # nobody is looking at. Nothing downstream will ever claim this
+            # temp file, so delete it here instead of leaking it.
+            self._delete_temp_file(path)
+            return
+
         self.setEnabled(True)
         self._chosen_path = path
-        self.accept()
+        self._status_label.setText("Ready")
+        self.imageReady.emit(path)
 
     def _on_download_error(self, error_tuple, action: str) -> None:
+        if self._abandoned:
+            return
+
         from PyQt6.QtWidgets import QMessageBox
 
         from iopenpod.artwork_search.errors import describe_artwork_error
@@ -394,6 +478,23 @@ class ArtworkSearchDialog(QDialog):
         info = describe_artwork_error(value, action=action)
         self._status_label.setText(info.title)
         QMessageBox.warning(self, info.title, info.message)
+
+    @staticmethod
+    def _delete_temp_file(path: str) -> None:
+        import os
+
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def reject(self) -> None:
+        self._abandoned = True
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        self._abandoned = True
+        super().closeEvent(event)
 
 
 class _ArtworkResultCard(QFrame):

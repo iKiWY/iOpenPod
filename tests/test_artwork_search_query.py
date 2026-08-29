@@ -42,6 +42,25 @@ def test_seed_single_track_without_album_uses_artist_and_title() -> None:
     assert seed.album == ""
 
 
+def test_seed_single_track_with_album_but_no_artist_searches_album() -> None:
+    tracks = [_track(Album="Discovery", Title="One More Time")]
+    seed = seed_query_from_tracks(tracks)
+    assert seed.text == "Discovery"
+    assert seed.album == "Discovery"
+    assert seed.artist == ""
+
+
+def test_seed_shared_album_with_disagreeing_artists_searches_album() -> None:
+    tracks = [
+        _track(Album="Various Artists Compilation", Artist="Daft Punk", Title="One More Time"),
+        _track(Album="Various Artists Compilation", Artist="Aphex Twin", Title="Xtal"),
+    ]
+    seed = seed_query_from_tracks(tracks)
+    assert seed.text == "Various Artists Compilation"
+    assert seed.album == "Various Artists Compilation"
+    assert seed.artist == ""
+
+
 def test_seed_mixed_selection_is_empty() -> None:
     tracks = [
         _track(Album="Discovery", **{"Album Artist": "Daft Punk"}),

@@ -30,9 +30,19 @@ def _shared(tracks: list[dict], key: str) -> str:
 def seed_query_from_tracks(tracks: list[dict]) -> SeedQuery:
     """Pre-fill the search box from the selected tracks.
 
-    All tracks share an album  -> album artist + album, fielded.
-    Single track, no album     -> artist + title, fielded on artist only.
-    Anything else              -> empty.
+    All tracks share Album Artist (or Artist) and Album -> "{artist} {album}",
+        fielded: both artist and album are known, so
+        ``lucene_release_group_query`` can build ``releasegroup:… AND
+        artist:…``.
+    Album known but no resolvable artist (single track with no artist, or
+        multiple tracks that share an Album but disagree on artist) ->
+        the album name alone, still fielded on album (searching the album is
+        strictly better than an empty box or a bare track title).
+    Single track, no shared album, with a title -> "{artist} {title}" or the
+        bare title. This is always sent as free text, never fielded:
+        ``lucene_release_group_query`` only fields a query when both artist
+        and album are set, and a track title is not a release-group title.
+    Anything else -> empty.
     """
     if not tracks:
         return SeedQuery(text="")
@@ -42,6 +52,9 @@ def seed_query_from_tracks(tracks: list[dict]) -> SeedQuery:
 
     if album and artist:
         return SeedQuery(text=f"{artist} {album}", artist=artist, album=album)
+
+    if album:
+        return SeedQuery(text=album, album=album)
 
     if len(tracks) == 1:
         title = _field(tracks[0], "Title")

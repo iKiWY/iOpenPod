@@ -2979,17 +2979,26 @@ class TrackEditorDialog(QDialog):
         from .artworkSearchDialog import ArtworkSearchDialog
 
         search_dialog = ArtworkSearchDialog(seed_query_from_tracks(self._tracks), self)
-        if search_dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+        search_dialog.imageReady.connect(
+            lambda downloaded_path, dlg=search_dialog: self._on_artwork_search_image_ready(dlg, downloaded_path)
+        )
+        # The dialog closes itself (accept()) once a crop is applied
+        # below; a plain Cancel/Esc/window-close just rejects it here with
+        # nothing left to do.
+        search_dialog.exec()
 
-        downloaded_path = search_dialog.chosen_image_path()
-        if not downloaded_path:
-            return
+    def _on_artwork_search_image_ready(self, search_dialog: QDialog, downloaded_path: str) -> None:
+        """Run the crop dialog on a just-downloaded image, on top of the still-open search dialog.
 
+        Cancelling the cropper (or failing to open the download) must return
+        to the search dialog with its results intact rather than discarding
+        the search, so this only closes ``search_dialog`` on a successful
+        crop. Every path removes the downloaded temp file exactly once.
+        """
         try:
-            crop_dialog = _ArtworkCropDialog(downloaded_path, self)
+            crop_dialog = _ArtworkCropDialog(downloaded_path, search_dialog)
         except (OSError, UnidentifiedImageError) as exc:
-            QMessageBox.warning(self, "Artwork Image", f"Could not open that image:\n\n{exc}")
+            QMessageBox.warning(search_dialog, "Artwork Image", f"Could not open that image:\n\n{exc}")
             self._remove_temp_file(downloaded_path)
             return
 
@@ -3002,7 +3011,7 @@ class TrackEditorDialog(QDialog):
         try:
             temp_path = self._save_cropped_artwork(cropped)
         except Exception as exc:
-            QMessageBox.warning(self, "Artwork Image", f"Could not prepare cropped artwork:\n\n{exc}")
+            QMessageBox.warning(search_dialog, "Artwork Image", f"Could not prepare cropped artwork:\n\n{exc}")
             return
 
         self._discard_pending_artwork()
@@ -3010,6 +3019,7 @@ class TrackEditorDialog(QDialog):
         if self._artwork_panel is not None:
             self._artwork_panel.set_pending_artwork(cropped, downloaded_path)
         self._update_change_summary()
+        search_dialog.accept()
 
     @staticmethod
     def _remove_temp_file(path: str) -> None:
