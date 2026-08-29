@@ -148,6 +148,65 @@ def test_network_error_raises_friendly_error(monkeypatch) -> None:
         coverart.search(SeedQuery(text="x"))
 
 
+_MBID_A = "48117b90-a16e-34ca-a514-19c702df1158"
+_MBID_B = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+_MB_PAYLOAD_TWO = {
+    "count": 2,
+    "release-groups": [
+        {
+            "id": _MBID_A,
+            "title": "Bad Payload",
+            "score": 100,
+            "first-release-date": "2001-02-26",
+            "artist-credit": [{"name": "Daft Punk"}],
+        },
+        {
+            "id": _MBID_B,
+            "title": "Discovery",
+            "score": 90,
+            "first-release-date": "2001-02-26",
+            "artist-credit": [{"name": "Daft Punk"}],
+        },
+    ],
+}
+
+
+def _router_by_mbid(mb, caa_by_mbid: dict, status_by_mbid: dict | None = None):
+    status_by_mbid = status_by_mbid or {}
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        if "musicbrainz.org" in url:
+            return _FakeResponse(mb)
+        mbid = url.rsplit("/", 1)[-1]
+        return _FakeResponse(caa_by_mbid[mbid], status=status_by_mbid.get(mbid, 200))
+
+    return fake_get
+
+
+def test_one_release_groups_404_does_not_affect_the_other(monkeypatch) -> None:
+    caa_by_mbid = {_MBID_A: {}, _MBID_B: _CAA_PAYLOAD}
+    monkeypatch.setattr(
+        coverart.requests,
+        "get",
+        _router_by_mbid(_MB_PAYLOAD_TWO, caa_by_mbid, status_by_mbid={_MBID_A: 404}),
+    )
+    results = coverart.search(SeedQuery(text="daft punk discovery"))
+    assert len(results) == 1
+    assert results[0].title == "Discovery"
+
+
+def test_one_release_groups_malformed_payload_does_not_affect_the_other(monkeypatch) -> None:
+    """A malformed CAA payload for one release group (e.g. a non-dict images entry)
+    must be skipped like any other failure, not crash the whole batch and wipe out
+    an already-successful sibling lookup."""
+    caa_by_mbid = {_MBID_A: {"images": [42]}, _MBID_B: _CAA_PAYLOAD}
+    monkeypatch.setattr(coverart.requests, "get", _router_by_mbid(_MB_PAYLOAD_TWO, caa_by_mbid))
+    results = coverart.search(SeedQuery(text="daft punk discovery"))
+    assert len(results) == 1
+    assert results[0].title == "Discovery"
+
+
 def test_musicbrainz_request_uses_fielded_query_and_user_agent(monkeypatch) -> None:
     captured: dict = {}
 

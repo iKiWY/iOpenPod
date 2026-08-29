@@ -122,6 +122,25 @@ def _candidate_for(release_group: dict) -> ArtworkCandidate | None:
         )
         response.raise_for_status()
         payload = response.json()
+
+        for image in payload.get("images", []):
+            if not image.get("front"):
+                continue
+            thumbnails = image.get("thumbnails") or {}
+            original = str(image.get("image") or "").strip()
+            full_url = _pick(thumbnails, _FULL_KEYS) or original
+            thumb_url = _pick(thumbnails, _THUMB_KEYS) or full_url
+            if not full_url:
+                continue
+            return ArtworkCandidate(
+                title=str(release_group.get("title") or "").strip(),
+                artist=_artist_of(release_group),
+                source=SOURCE_NAME,
+                thumb_url=thumb_url,
+                full_url=full_url,
+                year=str(release_group.get("first-release-date") or "")[:4],
+            )
+        return None
     except requests.HTTPError as exc:
         # 404 with an HTML body is the normal "this release has no art" answer.
         status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -129,28 +148,12 @@ def _candidate_for(release_group: dict) -> ArtworkCandidate | None:
             return None
         log.debug("Cover Art Archive lookup failed for %s: %s", mbid, exc)
         return None
-    except (requests.RequestException, ValueError) as exc:
+    except (requests.RequestException, ValueError, AttributeError, TypeError, KeyError) as exc:
+        # Covers both transport/JSON failures and an unexpected payload shape
+        # (e.g. a non-dict images entry) — either way, skip this one release
+        # group without aborting the others.
         log.debug("Cover Art Archive lookup failed for %s: %s", mbid, exc)
         return None
-
-    for image in payload.get("images", []):
-        if not image.get("front"):
-            continue
-        thumbnails = image.get("thumbnails") or {}
-        original = str(image.get("image") or "").strip()
-        full_url = _pick(thumbnails, _FULL_KEYS) or original
-        thumb_url = _pick(thumbnails, _THUMB_KEYS) or full_url
-        if not full_url:
-            continue
-        return ArtworkCandidate(
-            title=str(release_group.get("title") or "").strip(),
-            artist=_artist_of(release_group),
-            source=SOURCE_NAME,
-            thumb_url=thumb_url,
-            full_url=full_url,
-            year=str(release_group.get("first-release-date") or "")[:4],
-        )
-    return None
 
 
 def search(seed: SeedQuery, limit: int = 8) -> list[ArtworkCandidate]:
