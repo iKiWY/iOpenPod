@@ -2023,6 +2023,7 @@ class _ArtworkPreviewPanel(QFrame):
 
     changeArtworkRequested = pyqtSignal()
     unifyArtworkRequested = pyqtSignal()
+    searchArtworkRequested = pyqtSignal()
 
     def __init__(
         self,
@@ -2093,6 +2094,13 @@ class _ArtworkPreviewPanel(QFrame):
         self._unify_btn.setToolTip("Pick one selected artwork image for all selected tracks")
         self._unify_btn.clicked.connect(self.unifyArtworkRequested.emit)
         header.addWidget(self._unify_btn)
+
+        self._search_btn = QPushButton("Find Artwork Online")
+        self._search_btn.setStyleSheet(btn_css())
+        self._search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._search_btn.setToolTip("Search iTunes and the Cover Art Archive for a cover")
+        self._search_btn.clicked.connect(self.searchArtworkRequested.emit)
+        header.addWidget(self._search_btn)
 
         layout.addLayout(header)
 
@@ -2775,6 +2783,7 @@ class TrackEditorDialog(QDialog):
             self._artwork_panel = _ArtworkPreviewPanel(artworks, self._tracks, body)
             self._artwork_panel.changeArtworkRequested.connect(self._choose_artwork)
             self._artwork_panel.unifyArtworkRequested.connect(self._unify_artwork)
+            self._artwork_panel.searchArtworkRequested.connect(self._search_artwork)
             body_layout.addWidget(self._artwork_panel)
 
         page_rows: list[_TrackFieldRow] = []
@@ -2963,6 +2972,51 @@ class TrackEditorDialog(QDialog):
         if self._artwork_panel is not None:
             self._artwork_panel.set_pending_artwork(cropped, file_path)
         self._update_change_summary()
+
+    def _search_artwork(self) -> None:
+        from iopenpod.artwork_search.query import seed_query_from_tracks
+
+        from .artworkSearchDialog import ArtworkSearchDialog
+
+        search_dialog = ArtworkSearchDialog(seed_query_from_tracks(self._tracks), self)
+        if search_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        downloaded_path = search_dialog.chosen_image_path()
+        if not downloaded_path:
+            return
+
+        try:
+            crop_dialog = _ArtworkCropDialog(downloaded_path, self)
+        except (OSError, UnidentifiedImageError) as exc:
+            QMessageBox.warning(self, "Artwork Image", f"Could not open that image:\n\n{exc}")
+            self._remove_temp_file(downloaded_path)
+            return
+
+        accepted = crop_dialog.exec() == QDialog.DialogCode.Accepted
+        cropped = crop_dialog.cropped_image() if accepted else None
+        self._remove_temp_file(downloaded_path)
+        if cropped is None:
+            return
+
+        try:
+            temp_path = self._save_cropped_artwork(cropped)
+        except Exception as exc:
+            QMessageBox.warning(self, "Artwork Image", f"Could not prepare cropped artwork:\n\n{exc}")
+            return
+
+        self._discard_pending_artwork()
+        self._pending_artwork_path = temp_path
+        if self._artwork_panel is not None:
+            self._artwork_panel.set_pending_artwork(cropped, downloaded_path)
+        self._update_change_summary()
+
+    @staticmethod
+    def _remove_temp_file(path: str) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     def _unify_artwork(self) -> None:
         if self._artwork_panel is None:
