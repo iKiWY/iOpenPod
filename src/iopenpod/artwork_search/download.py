@@ -85,6 +85,33 @@ def fetch_image(url: str) -> bytes:
             "That address redirected too many times",
             "The image address kept forwarding somewhere else. Try a direct link to the image.",
         ) from exc
+    except requests.HTTPError as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        code = f"HTTP {status}" if isinstance(status, int) else ""
+        if isinstance(status, int) and 400 <= status < 500:
+            raise ArtworkSearchError(
+                ArtworkErrorInfo(
+                    title="That image is not available",
+                    message="The server refused the request, or the image has moved or been removed.",
+                    code=code,
+                )
+            ) from exc
+        raise ArtworkSearchError(
+            ArtworkErrorInfo(
+                title="The image server is having trouble",
+                message="The server answered with an error. This usually clears up after a little while.",
+                code=code,
+            )
+        ) from exc
+    except requests.RequestException as exc:
+        # Timeouts, DNS and connection failures. Without this the docstring's
+        # promise is false and a caller catching only ArtworkSearchError
+        # propagates a raw requests exception.
+        log.debug("Artwork download failed for %s", url, exc_info=True)
+        raise _fail(
+            "Could not reach that image",
+            "iOpenPod could not download the image. Check your connection and try again.",
+        ) from exc
     finally:
         session.close()
 

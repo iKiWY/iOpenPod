@@ -316,3 +316,58 @@ def test_widening_then_narrowing_does_not_overlap_rows(dialog) -> None:
         assert all(pitch >= card_height for pitch in pitches), (
             f"rows overlap at width {width}: pitches={pitches} card_height={card_height}"
         )
+
+
+def test_grid_fills_up_when_the_other_provider_returns_nothing(dialog) -> None:
+    """A half-empty grid was the cost of the anti-starvation cap.
+
+    iTunes is held to its share while Cover Art Archive is outstanding, but
+    CAA often has no art for a query. Once every provider has settled there
+    is nobody left to reserve slots for, so the results held back by the cap
+    must fill the grid rather than leaving the user with half of it.
+    """
+    from iopenpod.gui.widgets.artworkSearchDialog import MAX_RESULTS
+
+    dialog._pending_providers = 2
+    dialog.append_results([_candidate(f"https://itunes/{i}.jpg") for i in range(MAX_RESULTS)])
+    assert dialog.result_count() == MAX_RESULTS // 2, "iTunes should be held to its share here"
+
+    dialog._on_worker_finished()          # iTunes settles
+    dialog.append_results([])             # Cover Art Archive has nothing
+    dialog._on_worker_finished()          # CAA settles, nothing left to reserve for
+
+    assert dialog.result_count() == MAX_RESULTS
+
+
+def test_grid_fills_up_when_the_other_provider_never_reports(dialog) -> None:
+    """Same reclaim must happen when a provider is cancelled mid-search."""
+    from iopenpod.gui.widgets.artworkSearchDialog import MAX_RESULTS
+
+    dialog._pending_providers = 2
+    dialog.append_results([_candidate(f"https://itunes/{i}.jpg") for i in range(MAX_RESULTS)])
+
+    dialog._on_worker_finished()
+    dialog._on_worker_finished()          # cancelled worker: finished only, no results
+
+    assert dialog.result_count() == MAX_RESULTS
+
+
+def test_both_providers_delivering_still_splits_the_grid(dialog) -> None:
+    """Reclaim must not let the fast provider take slots the slow one used."""
+    from iopenpod.gui.widgets.artworkSearchDialog import MAX_RESULTS
+
+    dialog._pending_providers = 2
+    dialog.append_results([_candidate(f"https://itunes/{i}.jpg") for i in range(MAX_RESULTS)])
+    dialog._on_worker_finished()
+    dialog.append_results(
+        [_candidate(f"https://caa/{i}.jpg", source="Cover Art Archive") for i in range(MAX_RESULTS)]
+    )
+    dialog._on_worker_finished()
+
+    by_source: dict[str, int] = {}
+    for candidate in dialog._candidates:
+        by_source[candidate.source] = by_source.get(candidate.source, 0) + 1
+
+    assert dialog.result_count() == MAX_RESULTS
+    assert by_source["iTunes"] == MAX_RESULTS // 2
+    assert by_source["Cover Art Archive"] == MAX_RESULTS // 2

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 
 import pytest
+import requests
 from PIL import Image
 
 from iopenpod.artwork_search import download
@@ -23,7 +24,9 @@ class _FakeResponse:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            raise AssertionError("should not be reached in these tests")
+            error = requests.HTTPError(f"HTTP {self.status_code}")
+            error.response = self  # type: ignore[attr-defined]
+            raise error
 
     def iter_content(self, chunk_size: int = 8192):
         for start in range(0, len(self._body), chunk_size):
@@ -123,3 +126,45 @@ def test_session_redirect_cap_is_five(monkeypatch) -> None:
     download.fetch_image("https://example.com/a.png")
     assert session.max_redirects == download.MAX_REDIRECTS
     assert download.MAX_REDIRECTS == 5
+
+
+def test_http_client_error_becomes_an_artwork_search_error(monkeypatch) -> None:
+    """A 404 must not escape as a raw requests.HTTPError.
+
+    fetch_image promises ArtworkSearchError on every rejection; a caller
+    catching only that would otherwise see an unhandled requests exception.
+    """
+    session = _FakeSession(_FakeResponse(b"<html>not found</html>", content_type="text/html", status=404))
+    monkeypatch.setattr(download.requests, "Session", lambda: session)
+
+    with pytest.raises(ArtworkSearchError) as excinfo:
+        download.fetch_image("https://example.com/missing.png")
+
+    assert excinfo.value.info.code == "HTTP 404"
+    assert session.closed is True
+
+
+def test_http_server_error_becomes_an_artwork_search_error(monkeypatch) -> None:
+    session = _FakeSession(_FakeResponse(b"", content_type="text/html", status=503))
+    monkeypatch.setattr(download.requests, "Session", lambda: session)
+
+    with pytest.raises(ArtworkSearchError) as excinfo:
+        download.fetch_image("https://example.com/down.png")
+
+    assert excinfo.value.info.code == "HTTP 503"
+
+
+def test_connection_failure_becomes_an_artwork_search_error(monkeypatch) -> None:
+    session = _FakeSession(requests.ConnectionError("name resolution failed"))
+    monkeypatch.setattr(download.requests, "Session", lambda: session)
+
+    with pytest.raises(ArtworkSearchError):
+        download.fetch_image("https://nope.invalid/cover.png")
+
+
+def test_timeout_becomes_an_artwork_search_error(monkeypatch) -> None:
+    session = _FakeSession(requests.Timeout("too slow"))
+    monkeypatch.setattr(download.requests, "Session", lambda: session)
+
+    with pytest.raises(ArtworkSearchError):
+        download.fetch_image("https://example.com/slow.png")

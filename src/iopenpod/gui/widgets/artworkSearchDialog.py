@@ -124,6 +124,9 @@ class ArtworkSearchDialog(QDialog):
         self._candidates: list[ArtworkCandidate] = []
         self._seen_urls: set[str] = set()
         self._source_counts: dict[str, int] = {}
+        # Results held back by a source's share cap while another provider
+        # was still outstanding, replayed into the grid once none are.
+        self._deferred: list[ArtworkCandidate] = []
         # Cards are kept so a resize can re-place them at a new column count
         # without destroying already-loaded thumbnails. Column count is
         # recomputed from the viewport width on show and on every resize.
@@ -311,12 +314,16 @@ class ArtworkSearchDialog(QDialog):
         # provider (iTunes, ~300ms) cannot answer with a full page before a
         # slow one (MusicBrainz, rate-limited to 1req/s plus a second CAA
         # round trip) ever gets a chance to contribute.
-        per_provider_budget = max(1, MAX_RESULTS // len(modules))
-
+        # Ask each provider for a full grid, not its guaranteed share. The
+        # share is an *acceptance* cap applied while another provider is
+        # still outstanding; anything over it is held in _deferred and used
+        # to fill the grid once every provider has reported. Fetching only
+        # the share would leave nothing to fill it with when the other
+        # provider returns nothing — which for Cover Art Archive is common.
         pool = ThreadPoolSingleton.get_instance()
         for module in modules:
             name = module.SOURCE_NAME
-            worker = Worker(module.search, seed, per_provider_budget)
+            worker = Worker(module.search, seed, MAX_RESULTS)
             worker.signals.result.connect(
                 lambda candidates, gen=generation: self.append_results(candidates, _generation=gen)
             )
@@ -359,11 +366,12 @@ class ArtworkSearchDialog(QDialog):
             if candidate.full_url in self._seen_urls:
                 continue
             if self._source_counts.get(candidate.source, 0) >= effective_budget:
+                # Over this source's share while another provider may still
+                # need the slots. Hold it rather than discard it: if that
+                # provider returns nothing, _fill_from_deferred puts it back.
+                self._deferred.append(candidate)
                 continue
-            self._seen_urls.add(candidate.full_url)
-            self._candidates.append(candidate)
-            self._source_counts[candidate.source] = self._source_counts.get(candidate.source, 0) + 1
-            self._add_card(candidate, len(self._candidates) - 1)
+            self._accept_candidate(candidate)
             added = True
 
         if added:
@@ -371,6 +379,37 @@ class ArtworkSearchDialog(QDialog):
             self._state_panel.hide()
             self._grid_host.show()
         self._refresh_status()
+
+    def _accept_candidate(self, candidate: ArtworkCandidate) -> None:
+        """Take a candidate into the grid and record it against its source."""
+        self._seen_urls.add(candidate.full_url)
+        self._candidates.append(candidate)
+        self._source_counts[candidate.source] = self._source_counts.get(candidate.source, 0) + 1
+        self._add_card(candidate, len(self._candidates) - 1)
+
+    def _fill_from_deferred(self) -> None:
+        """Use held-back results to fill the grid once every provider is done.
+
+        The per-source cap reserves slots for a provider that may still be
+        working. Once none are outstanding there is nobody left to reserve
+        for, so a provider that returned more than its share may use the
+        space a provider that returned little or nothing did not need.
+        """
+        if not self._deferred:
+            return
+
+        added = False
+        while self._deferred and len(self._candidates) < MAX_RESULTS:
+            candidate = self._deferred.pop(0)
+            if candidate.full_url in self._seen_urls:
+                continue
+            self._accept_candidate(candidate)
+            added = True
+
+        if added:
+            self._showing_error = False
+            self._state_panel.hide()
+            self._grid_host.show()
 
     def note_provider_failed(self, provider: str, error_tuple=None, *, _generation: int | None = None) -> None:
         """Record a provider failure. Only both failing is fatal.
@@ -427,6 +466,8 @@ class ArtworkSearchDialog(QDialog):
             log.debug("Dropping stale worker-finished from generation %s (current %s)", _generation, self._search_generation)
             return
         self._pending_providers = max(0, self._pending_providers - 1)
+        if self._pending_providers == 0:
+            self._fill_from_deferred()
         self._refresh_status()
 
     def _refresh_status(self) -> None:
@@ -462,6 +503,7 @@ class ArtworkSearchDialog(QDialog):
         self._candidates = []
         self._seen_urls = set()
         self._source_counts = {}
+        self._deferred = []
         self._cards = []
         while self._grid.count():
             item = self._grid.takeAt(0)
