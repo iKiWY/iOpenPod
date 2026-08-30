@@ -43,8 +43,9 @@ from .podcastStates import PodcastStatePanel
 log = logging.getLogger(__name__)
 
 MAX_RESULTS = 24
-GRID_COLUMNS = 3
 THUMB_SIZE = 140
+GRID_SPACING = 10
+MIN_GRID_COLUMNS = 1
 
 # Every card is exactly the same size, so a result arriving late can never
 # move a card the user is already reaching for.
@@ -75,6 +76,15 @@ def _card_metrics() -> tuple[int, int]:
         )
         _card_metrics_cache = (line, height)
     return _card_metrics_cache
+
+
+def columns_for_width(width: int) -> int:
+    """How many fixed-width cards fit in ``width`` pixels of viewport.
+
+    ``n`` cards occupy ``n * CARD_WIDTH + (n - 1) * GRID_SPACING``, which
+    rearranges to the expression below.
+    """
+    return max(MIN_GRID_COLUMNS, (width + GRID_SPACING) // (CARD_WIDTH + GRID_SPACING))
 
 
 def _provider_modules():
@@ -114,6 +124,11 @@ class ArtworkSearchDialog(QDialog):
         self._candidates: list[ArtworkCandidate] = []
         self._seen_urls: set[str] = set()
         self._source_counts: dict[str, int] = {}
+        # Cards are kept so a resize can re-place them at a new column count
+        # without destroying already-loaded thumbnails. Column count is
+        # recomputed from the viewport width on show and on every resize.
+        self._cards: list[QWidget] = []
+        self._columns = MIN_GRID_COLUMNS
         self._failed_providers: list[str] = []
         self._first_failure_info = None
         self._pending_providers = 0
@@ -217,11 +232,8 @@ class ArtworkSearchDialog(QDialog):
         self._grid_host.setStyleSheet("background: transparent;")
         self._grid = QGridLayout(self._grid_host)
         self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setSpacing(10)
-        # Absorb leftover width in a phantom trailing column, otherwise the
-        # grid spreads it across the occupied columns and a lone result
-        # stretches to the full viewport.
-        self._grid.setColumnStretch(GRID_COLUMNS, 1)
+        self._grid.setSpacing(GRID_SPACING)
+        self._apply_column_stretch()
         self._outer_layout.addWidget(self._grid_host)
         self._outer_layout.addStretch()
 
@@ -232,6 +244,7 @@ class ArtworkSearchDialog(QDialog):
             }}
         """)
         scroll.setWidget(self._results_container)
+        self._scroll = scroll
         layout.addWidget(scroll, stretch=1)
 
         url_row = QHBoxLayout()
@@ -449,6 +462,7 @@ class ArtworkSearchDialog(QDialog):
         self._candidates = []
         self._seen_urls = set()
         self._source_counts = {}
+        self._cards = []
         while self._grid.count():
             item = self._grid.takeAt(0)
             widget = item.widget() if item is not None else None
@@ -458,12 +472,74 @@ class ArtworkSearchDialog(QDialog):
     def _add_card(self, candidate: ArtworkCandidate, index: int) -> None:
         card = _ArtworkResultCard(candidate, self, load_thumbnail=self._load_thumbnails)
         card.picked.connect(self._on_pick)
+        self._cards.append(card)
+        self._place_card(card, index)
+
+    # ── Responsive grid ──────────────────────────────────────────────────
+
+    def grid_columns(self) -> int:
+        """Cards per row at the dialog's current width."""
+        return self._columns
+
+    def _viewport_width(self) -> int:
+        scroll = getattr(self, "_scroll", None)
+        if scroll is None:
+            return CARD_WIDTH
+        return scroll.viewport().width()
+
+    def _place_card(self, card: QWidget, index: int) -> None:
         self._grid.addWidget(
             card,
-            index // GRID_COLUMNS,
-            index % GRID_COLUMNS,
+            index // self._columns,
+            index % self._columns,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
+
+    def _apply_column_stretch(self) -> None:
+        """Send leftover width to a phantom trailing column.
+
+        Without this the grid spreads the slack across the occupied columns
+        and a lone result stretches to the full viewport.
+        """
+        for column in range(self._grid.columnCount() + 2):
+            self._grid.setColumnStretch(column, 0)
+        self._grid.setColumnStretch(self._columns, 1)
+
+    def _reflow_grid(self) -> None:
+        """Re-place the existing cards at the current column count.
+
+        Detaches rather than deletes, so already-loaded thumbnails survive
+        a resize.
+        """
+        while self._grid.count():
+            self._grid.takeAt(0)
+        for index, card in enumerate(self._cards):
+            self._place_card(card, index)
+        self._apply_column_stretch()
+        # A narrower grid needs more rows, but the layout's cached size hint
+        # still describes the old row count — without invalidating it the host
+        # keeps its previous height and the fixed-height cards are crushed
+        # into overlapping rows.
+        self._grid.invalidate()
+        self._grid_host.updateGeometry()
+        self._results_container.adjustSize()
+
+    def _sync_columns_to_width(self) -> None:
+        columns = columns_for_width(self._viewport_width())
+        if columns == self._columns:
+            return
+        self._columns = columns
+        self._reflow_grid()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().resizeEvent(event)
+        # Guarded by the equality check in _sync_columns_to_width, so the
+        # relayout this may trigger cannot recurse.
+        self._sync_columns_to_width()
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().showEvent(event)
+        self._sync_columns_to_width()
 
     # ── Picking ──────────────────────────────────────────────────────────
 

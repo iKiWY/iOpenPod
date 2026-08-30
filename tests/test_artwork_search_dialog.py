@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from PyQt6.QtWidgets import QApplication
 
 from iopenpod.artwork_search.models import ArtworkCandidate
 from iopenpod.artwork_search.query import SeedQuery
@@ -206,10 +207,23 @@ def _cards(dialog) -> list:
     ]
 
 
+def _shown(dialog, width: int, height: int = 700):
+    """Show the dialog at a real size so the viewport has a usable width.
+
+    Column count is derived from the viewport, so a dialog that was never
+    shown reports a meaningless single column.
+    """
+    dialog.resize(width, height)
+    dialog.show()
+    dialog._grid.activate()
+    return dialog
+
+
 def test_every_card_is_the_same_fixed_size(dialog) -> None:
     """Cards must not resize to fill the row, whatever their text length."""
     from iopenpod.gui.widgets.artworkSearchDialog import CARD_WIDTH
 
+    _shown(dialog, 900)
     dialog.append_results([
         _candidate("https://a/1.jpg"),
         ArtworkCandidate(
@@ -233,7 +247,7 @@ def test_a_lone_result_does_not_stretch_to_the_full_width(dialog) -> None:
     """One result used to expand across the whole viewport."""
     from iopenpod.gui.widgets.artworkSearchDialog import CARD_WIDTH
 
-    dialog.resize(900, 700)
+    _shown(dialog, 900)
     dialog.append_results([_candidate("https://a/1.jpg")])
     dialog._grid.activate()
 
@@ -246,7 +260,7 @@ def test_late_results_do_not_move_the_cards_already_on_screen(dialog) -> None:
     Cover Art Archive answers well after iTunes, so a user reaching for an
     iTunes result must not have it move out from under the cursor.
     """
-    dialog.resize(900, 700)
+    _shown(dialog, 900)
     dialog.append_results([_candidate(f"https://a/{i}.jpg") for i in range(2)])
     dialog._grid.activate()
     before = [(card.pos(), card.size()) for card in _cards(dialog)]
@@ -258,3 +272,47 @@ def test_late_results_do_not_move_the_cards_already_on_screen(dialog) -> None:
     after = [(card.pos(), card.size()) for card in _cards(dialog)][: len(before)]
 
     assert after == before
+
+
+def test_column_count_follows_the_window_width(dialog) -> None:
+    """Wider window, more cards per row — not a hardcoded three."""
+    from iopenpod.gui.widgets.artworkSearchDialog import columns_for_width
+
+    _shown(dialog, 640)
+    dialog.append_results([_candidate(f"https://a/{i}.jpg") for i in range(12)])
+
+    seen = {}
+    for width in (640, 900, 1200, 900, 640):
+        dialog.resize(width, 700)
+        dialog._grid.activate()
+        seen[width] = dialog.grid_columns()
+
+    assert seen[900] > seen[640], f"widening did not add a column: {seen}"
+    assert seen[1200] > seen[900], f"widening did not add a column: {seen}"
+    # Shrinking must give the columns back, not leave them stuck wide.
+    assert seen[640] == columns_for_width(dialog._viewport_width())
+
+
+def test_widening_then_narrowing_does_not_overlap_rows(dialog) -> None:
+    """Going back to a narrower window must give the extra row real space.
+
+    The grid caches its size hint. Widening drops a row and shrinks the
+    host; narrowing again needs that row back, and without invalidating the
+    hint the host stays short and the fixed-height cards are stacked on top
+    of one another — cards overlapping by ~70px in the real dialog.
+    """
+    _shown(dialog, 720)
+    dialog.append_results([_candidate(f"https://a/{i}.jpg") for i in range(12)])
+
+    for width in (720, 1100, 720, 900, 640):
+        dialog.resize(width, 640)
+        QApplication.processEvents()
+        dialog._grid.activate()
+        QApplication.processEvents()
+        cards = _cards(dialog)
+        card_height = max(card.height() for card in cards)
+        rows = sorted({card.y() for card in cards})
+        pitches = [b - a for a, b in zip(rows, rows[1:], strict=False)]
+        assert all(pitch >= card_height for pitch in pitches), (
+            f"rows overlap at width {width}: pitches={pitches} card_height={card_height}"
+        )
