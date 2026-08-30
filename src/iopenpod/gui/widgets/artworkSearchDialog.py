@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import logging
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QImage, QPixmap
+from PyQt6.QtCore import QRect, Qt, pyqtSignal
+from PyQt6.QtGui import QFont, QFontMetrics, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
@@ -45,6 +45,36 @@ log = logging.getLogger(__name__)
 MAX_RESULTS = 24
 GRID_COLUMNS = 3
 THUMB_SIZE = 140
+
+# Every card is exactly the same size, so a result arriving late can never
+# move a card the user is already reaching for.
+_CARD_PADDING = 8
+_CARD_SPACING = 4
+_TITLE_LINES = 2
+_TEXT_ROWS = _TITLE_LINES + 2  # title lines, then artist and detail
+CARD_WIDTH = THUMB_SIZE + _CARD_PADDING * 2
+
+_card_metrics_cache: tuple[int, int] | None = None
+
+
+def _card_metrics() -> tuple[int, int]:
+    """Return ``(line_height, card_height)`` for a result card.
+
+    Derived from font metrics rather than hardcoded so the grid stays
+    uniform across themes and display scales. Cached because every card
+    uses the same font and must therefore be the same height.
+    """
+    global _card_metrics_cache
+    if _card_metrics_cache is None:
+        line = QFontMetrics(QFont(FONT_FAMILY, Metrics.FONT_SM)).height()
+        height = (
+            _CARD_PADDING * 2          # top and bottom padding
+            + THUMB_SIZE               # thumbnail
+            + _CARD_SPACING * 3        # gaps between the four rows
+            + line * _TEXT_ROWS        # title (2 lines), artist, detail
+        )
+        _card_metrics_cache = (line, height)
+    return _card_metrics_cache
 
 
 def _provider_modules():
@@ -167,6 +197,9 @@ class ArtworkSearchDialog(QDialog):
         layout.addWidget(self._status_label)
 
         self._results_container = QWidget()
+        # Fixed-size cards no longer cover the whole viewport, so these hosts
+        # must be transparent or their unthemed default paints beside the grid.
+        self._results_container.setStyleSheet("background: transparent;")
         self._outer_layout = QVBoxLayout(self._results_container)
         self._outer_layout.setContentsMargins(0, 0, 0, 0)
         self._outer_layout.setSpacing(8)
@@ -181,9 +214,14 @@ class ArtworkSearchDialog(QDialog):
         self._outer_layout.addWidget(self._state_panel)
 
         self._grid_host = QWidget()
+        self._grid_host.setStyleSheet("background: transparent;")
         self._grid = QGridLayout(self._grid_host)
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setSpacing(10)
+        # Absorb leftover width in a phantom trailing column, otherwise the
+        # grid spreads it across the occupied columns and a lone result
+        # stretches to the full viewport.
+        self._grid.setColumnStretch(GRID_COLUMNS, 1)
         self._outer_layout.addWidget(self._grid_host)
         self._outer_layout.addStretch()
 
@@ -420,7 +458,12 @@ class ArtworkSearchDialog(QDialog):
     def _add_card(self, candidate: ArtworkCandidate, index: int) -> None:
         card = _ArtworkResultCard(candidate, self, load_thumbnail=self._load_thumbnails)
         card.picked.connect(self._on_pick)
-        self._grid.addWidget(card, index // GRID_COLUMNS, index % GRID_COLUMNS)
+        self._grid.addWidget(
+            card,
+            index // GRID_COLUMNS,
+            index % GRID_COLUMNS,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
 
     # ── Picking ──────────────────────────────────────────────────────────
 
@@ -506,6 +549,15 @@ class _ArtworkResultCard(QFrame):
         super().__init__(parent)
         self._candidate = candidate
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        line_height, card_height = _card_metrics()
+        self.setFixedSize(CARD_WIDTH, card_height)
+        # Rows are elided to fit the fixed card, so the tooltip carries the
+        # full text — nothing is only visible when a title happens to be short.
+        tooltip = "\n".join(
+            part for part in (candidate.title, candidate.artist, candidate.detail_line) if part
+        )
+        if tooltip:
+            self.setToolTip(tooltip)
         self.setStyleSheet(f"""
             _ArtworkResultCard {{
                 background: {paint_css('surface.inset')};
@@ -518,8 +570,8 @@ class _ArtworkResultCard(QFrame):
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(_CARD_PADDING, _CARD_PADDING, _CARD_PADDING, _CARD_PADDING)
+        layout.setSpacing(_CARD_SPACING)
 
         self._art_label = QLabel()
         self._art_label.setFixedSize(THUMB_SIZE, THUMB_SIZE)
@@ -531,22 +583,70 @@ class _ArtworkResultCard(QFrame):
         """)
         layout.addWidget(self._art_label, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        title = make_label(candidate.title, size=Metrics.FONT_SM, weight=QFont.Weight.DemiBold)
+        # Fixed heights on every text row: a long album title must not be
+        # allowed to grow its card and push the rows below it around.
+        title = make_label(
+            self._elide_to_lines(candidate.title, line_height, _TITLE_LINES),
+            size=Metrics.FONT_SM,
+            weight=QFont.Weight.DemiBold,
+        )
         title.setWordWrap(True)
-        title.setFixedWidth(THUMB_SIZE)
+        title.setFixedSize(THUMB_SIZE, line_height * _TITLE_LINES)
+        title.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(title)
 
-        artist = make_label(candidate.artist, size=Metrics.FONT_SM, style=LABEL_SECONDARY())
-        artist.setWordWrap(True)
-        artist.setFixedWidth(THUMB_SIZE)
+        artist = make_label(
+            self._elide(candidate.artist, line_height),
+            size=Metrics.FONT_SM,
+            style=LABEL_SECONDARY(),
+        )
+        artist.setFixedSize(THUMB_SIZE, line_height)
         layout.addWidget(artist)
 
-        detail = make_label(candidate.detail_line, size=Metrics.FONT_SM, style=LABEL_SECONDARY())
-        detail.setFixedWidth(THUMB_SIZE)
+        detail = make_label(
+            self._elide(candidate.detail_line, line_height),
+            size=Metrics.FONT_SM,
+            style=LABEL_SECONDARY(),
+        )
+        detail.setFixedSize(THUMB_SIZE, line_height)
         layout.addWidget(detail)
 
         if load_thumbnail:
             self._load_thumbnail(candidate.thumb_url)
+
+    @staticmethod
+    def _elide(text: str, _line_height: int) -> str:
+        """Shorten text to one card-width line so it cannot wrap."""
+        if not text:
+            return ""
+        metrics = QFontMetrics(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        return metrics.elidedText(text, Qt.TextElideMode.ElideRight, THUMB_SIZE)
+
+    @staticmethod
+    def _elide_to_lines(text: str, line_height: int, lines: int) -> str:
+        """Shorten wrapped text to ``lines`` rows, marking the cut with an ellipsis.
+
+        Qt only elides single lines, and a bare fixed height clips mid-word with
+        no visual sign it was truncated — so a cut title reads as if it were the
+        whole title.
+        """
+        if not text:
+            return ""
+        metrics = QFontMetrics(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        bounds = QRect(0, 0, THUMB_SIZE, 0)
+        flags = Qt.TextFlag.TextWordWrap
+        limit = line_height * lines
+
+        if metrics.boundingRect(bounds, flags, text).height() <= limit:
+            return text
+
+        truncated = text
+        while truncated:
+            truncated = truncated[:-1].rstrip()
+            candidate = f"{truncated}…"
+            if metrics.boundingRect(bounds, flags, candidate).height() <= limit:
+                return candidate
+        return text
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         if event.button() == Qt.MouseButton.LeftButton:

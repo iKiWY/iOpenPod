@@ -194,3 +194,67 @@ def test_download_abandoned_by_closing_the_dialog_deletes_the_temp_file(dialog, 
 
     assert not leaked.exists()
     assert dialog.chosen_image_path() is None
+
+
+def _cards(dialog) -> list:
+    """Every result card currently laid out in the grid, in grid order."""
+    grid = dialog._grid
+    return [
+        grid.itemAt(index).widget()
+        for index in range(grid.count())
+        if grid.itemAt(index).widget() is not None
+    ]
+
+
+def test_every_card_is_the_same_fixed_size(dialog) -> None:
+    """Cards must not resize to fill the row, whatever their text length."""
+    from iopenpod.gui.widgets.artworkSearchDialog import CARD_WIDTH
+
+    dialog.append_results([
+        _candidate("https://a/1.jpg"),
+        ArtworkCandidate(
+            title="A Very Long Album Title That Would Otherwise Wrap Onto Several Lines",
+            artist="An Extremely Long Artist Name That Would Also Wrap",
+            source="iTunes",
+            thumb_url="https://a/2.jpg",
+            full_url="https://a/2.jpg",
+            year="1999",
+            width=1200,
+        ),
+    ])
+    dialog._grid.activate()
+
+    sizes = {(card.width(), card.height()) for card in _cards(dialog)}
+    assert len(sizes) == 1, f"cards differ in size: {sizes}"
+    assert sizes.pop()[0] == CARD_WIDTH
+
+
+def test_a_lone_result_does_not_stretch_to_the_full_width(dialog) -> None:
+    """One result used to expand across the whole viewport."""
+    from iopenpod.gui.widgets.artworkSearchDialog import CARD_WIDTH
+
+    dialog.resize(900, 700)
+    dialog.append_results([_candidate("https://a/1.jpg")])
+    dialog._grid.activate()
+
+    assert _cards(dialog)[0].width() == CARD_WIDTH
+
+
+def test_late_results_do_not_move_the_cards_already_on_screen(dialog) -> None:
+    """The misclick bug: a slow provider landing must not shift existing cards.
+
+    Cover Art Archive answers well after iTunes, so a user reaching for an
+    iTunes result must not have it move out from under the cursor.
+    """
+    dialog.resize(900, 700)
+    dialog.append_results([_candidate(f"https://a/{i}.jpg") for i in range(2)])
+    dialog._grid.activate()
+    before = [(card.pos(), card.size()) for card in _cards(dialog)]
+
+    dialog.append_results([
+        _candidate(f"https://b/{i}.jpg", source="Cover Art Archive") for i in range(6)
+    ])
+    dialog._grid.activate()
+    after = [(card.pos(), card.size()) for card in _cards(dialog)][: len(before)]
+
+    assert after == before

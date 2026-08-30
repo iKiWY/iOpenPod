@@ -27,4 +27,5 @@ class ArtworkCandidate:
         parts = [part for part in (self.year, self.source) if part]
         if self.width:
             parts.append(f"{self.width}px")
-        return "  ·  ".join(parts)
+        # Tight separator: this has to fit one fixed-width card row.
+        return " · ".join(parts)
